@@ -21,13 +21,11 @@ const WHATSAPP_BUSINESS_ACCOUNT_ID = process.env.WHATSAPP_ACCOUNT_ID;
 const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_TOKEN;
 const WHATSAPP_PHONE = '+528142850036';
 
-// OpenAI
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   defaultHeaders: { 'Accept-Encoding': 'identity' },
 });
 
-// Email
 const emailTransporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
@@ -36,12 +34,10 @@ const emailTransporter = nodemailer.createTransport({
   },
 });
 
-// ===== BASE DE DATOS EN MEMORIA =====
+// ===== MEMORIA EN PROCESO =====
 const proyectos = new Map();
 const cotizaciones = new Map();
-
-// Historial de conversaciones por cliente (últimos 10 mensajes)
-const conversaciones = new Map();
+const conversaciones = new Map(); // clienteId → [{role, content}]
 
 // ===== MODELOS =====
 class Proyecto {
@@ -66,9 +62,7 @@ class Proyecto {
   }
 
   calcularCosto() {
-    const posiciones = this.calcularPosiciones();
-    const costoPorPosicion = 1560;
-    return posiciones * costoPorPosicion;
+    return this.calcularPosiciones() * 1560;
   }
 
   toJSON() {
@@ -91,73 +85,214 @@ class Proyecto {
   }
 }
 
-// ===== TARA™ — SYSTEM PROMPT =====
-const TARA_SYSTEM_PROMPT = `Eres TARA™, parte del equipo comercial de Total Racks, empresa de racks industriales en el noreste de México.
+// ============================================================
+// BEHAVIOR LAYER — EVALUACIÓN DE CONTEXTO PRE-RESPUESTA
+// ============================================================
+
+/**
+ * Extrae datos conocidos del cliente escaneando el historial de la conversación.
+ * Simple y rápido — OpenAI hace la interpretación profunda.
+ */
+function extraerDatosConocidos(historial) {
+  const textos = historial.map(m => m.content).join('\n');
+
+  const conocido = {};
+
+  // Nombre
+  const nombre = textos.match(/(?:soy|me llamo|mi nombre es)\s+([A-ZÁÉÍÓÚÑa-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑa-záéíóúñ]+){0,2})/i);
+  if (nombre) conocido.nombre = nombre[1].trim();
+
+  // Empresa
+  const empresa = textos.match(/(?:empresa|compañía|negocio|de|trabajo en)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 &.,-]{2,30}?)(?:\.|,|\n|$)/i);
+  if (empresa) conocido.empresa = empresa[1].trim();
+
+  // Correo
+  const correo = textos.match(/[\w.+%-]+@[\w-]+\.[a-zA-Z]{2,}/);
+  if (correo) conocido.correo = correo[0];
+
+  // Ciudad
+  const ciudades = ['monterrey', 'apodaca', 'san nicolás', 'guadalupe', 'escobedo', 'santa catarina', 'saltillo', 'ramos arizpe', 'san pedro'];
+  for (const c of ciudades) {
+    if (textos.toLowerCase().includes(c)) { conocido.ciudad = c; break; }
+  }
+
+  // Tipo de rack
+  const tiposRack = ['selectivo', 'drive-in', 'drive in', 'cantilever', 'flow rack', 'entrepiso', 'locker'];
+  for (const r of tiposRack) {
+    if (textos.toLowerCase().includes(r)) { conocido.tipo_rack = r; break; }
+  }
+
+  // Peso por pallet
+  const peso = textos.match(/(\d+(?:\.\d+)?)\s*(?:kg|kilos?|ton(?:eladas?)?)\b/i);
+  if (peso) conocido.peso_pallet = peso[0];
+
+  // Altura de nave
+  const altura = textos.match(/(\d+(?:\.\d+)?)\s*(?:m|mts?|metros?)\s*(?:de\s+)?(?:altura|alto|libre)/i);
+  if (altura) conocido.altura_nave = altura[0];
+
+  // Mercancía
+  const mercancia = textos.match(/(?:almacenamos?|guardamos?|tenemos?|producto|mercancía)\s+([a-záéíóúñA-ZÁÉÍÓÚÑ ,]{3,40}?)(?:\.|,|\n|$)/i);
+  if (mercancia) conocido.mercancia = mercancia[1].trim();
+
+  return conocido;
+}
+
+/**
+ * Determina la etapa comercial basándose en lo que ya sabe TARA.
+ */
+function detectarEtapa(historial, conocido) {
+  const turnos = Math.floor(historial.length / 2);
+  const textos = historial.map(m => m.content).join('\n').toLowerCase();
+
+  const quiereCotizacion = /cotiz|presupuesto|precio|cuánto cuesta|cuanto cuesta|propuesta/.test(textos);
+  const quiereVisita = /visita|cita|vayan|vengan|ir a ver|revisar in situ/.test(textos);
+  const tieneContacto = !!(conocido.nombre && (conocido.empresa || conocido.correo));
+  const tieneTecnico = !!(conocido.tipo_rack || conocido.peso_pallet || conocido.altura_nave || conocido.mercancia);
+
+  if (tieneContacto && (quiereCotizacion || quiereVisita)) return 'Cotización';
+  if (quiereCotizacion || quiereVisita) return 'Recomendación';
+  if (tieneTecnico) return 'Calificación';
+  if (turnos >= 1) return 'Descubrimiento';
+  return 'Primer contacto';
+}
+
+/**
+ * Decide cuál es el siguiente paso lógico según la etapa y los datos faltantes.
+ */
+function siguientePasoLogico(etapa, faltantes, conocido) {
+  switch (etapa) {
+    case 'Primer contacto':
+      return 'Saludar y hacer una pregunta abierta para entender qué necesita.';
+    case 'Descubrimiento':
+      if (!conocido.mercancia) return 'Preguntar qué tipo de mercancía o producto almacena.';
+      return 'Identificar el tipo de sistema que puede necesitar.';
+    case 'Calificación':
+      if (!conocido.peso_pallet) return 'Preguntar peso por pallet o carga unitaria.';
+      if (!conocido.altura_nave) return 'Preguntar altura libre de la nave.';
+      if (!conocido.ciudad) return 'Preguntar en qué ciudad o zona está el almacén.';
+      return 'Dar recomendación técnica con justificación concreta.';
+    case 'Recomendación':
+      if (!conocido.nombre) return 'Pedir nombre y empresa para avanzar a propuesta.';
+      if (!conocido.correo) return 'Pedir correo electrónico para enviar la propuesta.';
+      return 'Proponer visita técnica o cotización formal.';
+    case 'Cotización':
+      return 'Confirmar datos de contacto y coordinar visita técnica o propuesta formal.';
+    default:
+      return 'Avanzar naturalmente hacia el siguiente paso comercial.';
+  }
+}
+
+/**
+ * Construye el bloque de contexto dinámico que se inyecta al prompt antes de llamar a OpenAI.
+ * Este bloque es el "pensamiento previo" de TARA — nunca lo ve el cliente.
+ */
+function construirContextoDinamico(historial) {
+  const conocido = extraerDatosConocidos(historial);
+  const etapa = detectarEtapa(historial, conocido);
+
+  const camposDatos = [
+    ['nombre', conocido.nombre],
+    ['empresa', conocido.empresa],
+    ['ciudad', conocido.ciudad],
+    ['correo', conocido.correo],
+    ['mercancía', conocido.mercancia],
+    ['tipo de rack', conocido.tipo_rack],
+    ['peso por pallet', conocido.peso_pallet],
+    ['altura de nave', conocido.altura_nave],
+  ];
+
+  const confirmados = camposDatos.filter(([, v]) => v).map(([k, v]) => `• ${k}: ${v}`);
+  const faltantes = camposDatos.filter(([, v]) => !v).map(([k]) => k);
+
+  const siguiente = siguientePasoLogico(etapa, faltantes, conocido);
+
+  return `
+[EVALUACIÓN INTERNA — NO MOSTRAR AL CLIENTE]
+Etapa comercial actual: ${etapa}
+${confirmados.length ? `Ya sé:\n${confirmados.join('\n')}` : 'No tengo datos del cliente aún.'}
+Falta conocer: ${faltantes.length ? faltantes.join(', ') : 'nada crítico'}
+Siguiente paso: ${siguiente}
+Regla: NO preguntes lo que ya está en "Ya sé". Confirma si el cliente lo menciona de nuevo.
+[FIN EVALUACIÓN]
+`;
+}
+
+// ===== TARA™ — SYSTEM PROMPT BASE =====
+const TARA_SYSTEM_PROMPT = `Eres TARA™, parte del equipo comercial de Total Racks.
 
 IDENTIDAD:
-Hablas como una persona real que trabaja en Total Racks, no como intermediaria externa. Eres directa, cálida y consultiva. Nunca dices que eres IA, chatbot o modelo de lenguaje. No das respuestas de enciclopedia ni frases institucionales.
+Trabajas en Total Racks. Hablas en primera persona del plural cuando es natural: "coordinamos", "instalamos", "revisamos", "nuestra propuesta". Eres directa, cálida y segura. Nunca dices que eres IA, bot, ChatGPT ni sistema automático. No das respuestas de enciclopedia.
 
-FRASES PROHIBIDAS:
-- "Un especialista se pondrá en contacto"
-- "Nuestro equipo estará en comunicación"
-- "Aprecio tu entusiasmo"
-- "Estoy aquí para ayudarte"
-- "Gracias por tu mensaje"
-- "Como IA..." / "Como asistente..."
-- "Depende" sin explicar de qué depende
+FRASES PROHIBIDAS (nunca usarlas):
+"Un especialista se pondrá en contacto"
+"Nuestro equipo le contactará"
+"No tengo acceso a..."
+"No puedo verificar..."
+"Como inteligencia artificial..."
+"Aprecio tu entusiasmo"
+"Estoy aquí para ayudarte"
+"Gracias por tu mensaje"
 
 FRASES CORRECTAS:
-- "Con estos datos ya puedo pasar tu solicitud para coordinar la visita."
-- "Con esto avanzamos a la propuesta."
-- "Déjame confirmar lo que tengo y te digo qué falta."
+"Voy a coordinar la visita con el equipo técnico."
+"Con estos datos ya avanzo tu solicitud."
+"Déjame confirmar lo que tengo y te digo qué falta."
+"Nosotros nos encargamos de la instalación completa."
 
-ESPECIALIDAD:
+ESPECIALIDAD DE TOTAL RACKS:
 - Rack selectivo: acceso directo a cada pallet, alta rotación, SKUs variados.
 - Rack drive-in: máxima densidad, producto homogéneo, LIFO.
 - Rack cantilever: material largo sin embalaje (tubos, perfiles, madera, rollos).
 - Flow rack: FIFO estricto, líneas de producción, perecederos.
-- Entrepisos metálicos: aprovechan altura de nave creando segundo nivel.
+- Entrepisos metálicos: aprovechan la altura de nave creando segundo nivel.
 - Lockers industriales: herramientas, equipo personal.
 
-DIFERENCIADOR (solo cuando el cliente pregunte):
-"Además de fabricar e instalar, tenemos sistema digital propio para visualizar inventario y capacidad en tiempo real, sin pagar software adicional."
+DIFERENCIADOR (solo si el cliente lo pregunta):
+"Además de fabricar e instalar, tenemos un sistema digital propio para visualizar inventario y capacidad en tiempo real, sin costo adicional de software."
 
 GEOLOCALIZACIÓN:
-Si el cliente menciona ciudad o zona (Monterrey, San Nicolás, Apodaca, Guadalupe, Escobedo, Santa Catarina, Saltillo, Ramos Arizpe), úsala naturalmente.
-Ejemplo: "Con el proyecto en Apodaca podemos coordinar una visita dentro de la zona metropolitana."
+Cuando el cliente mencione una ciudad (Monterrey, Apodaca, San Nicolás, Guadalupe, Escobedo, Santa Catarina, Saltillo, Ramos Arizpe), úsala naturalmente una vez. No la repitas en cada mensaje.
 
-PROCESO COMERCIAL:
-1. Entender qué necesita (nunca vender antes de entender).
-2. Recopilar UNO O DOS datos por mensaje: mercancía, peso por pallet, medidas, altura libre, dimensiones del almacén, cantidad de posiciones, ciudad, urgencia.
-3. Cuando haya suficiente info, recomendar con justificación concreta.
-4. Pedir datos de contacto: nombre, empresa, correo, teléfono.
-5. Confirmar siguiente paso: visita técnica, cotización o llamada.
+MANEJO DE INFORMACIÓN AMBIGUA:
+Si algo no quedó claro, pregunta antes de asumir.
+Ejemplo: "¿Te refieres al dominio del correo? ¿Me lo compartes completo para registrarlo bien?"
+NUNCA inventes correos, dominios, empresas ni datos que el cliente no dio explícitamente.
+
+CONFIRMACIÓN DE DATOS:
+Cuando el cliente dé sus datos, confirma SOLO lo que entendiste con exactitud. Marca como pendiente lo ambiguo. No inventes nada.
+Formato:
+"Perfecto, [Nombre]. Confirmo:
+• Empresa: [empresa]
+• Ciudad: [ciudad]
+• Teléfono: mismo número de WhatsApp
+• Correo: [correo exacto]
+Con esto ya avanzo tu solicitud."
+
+EMPATÍA:
+Si el cliente agradece, responde con calidez natural. No con frases genéricas.
+Ejemplo: "Me alegra poder ayudarte, aquí estaré durante todo el proceso."
 
 REGLAS DE RESPUESTA:
-- Máximo 2 párrafos cortos. Estilo WhatsApp natural.
+- Máximo 2 párrafos cortos. Estilo WhatsApp.
 - Una sola pregunta por mensaje cuando sea posible.
-- Nunca repetir preguntas ya respondidas en el historial.
-- Nunca inventar datos, correos, dominios ni información que el cliente no dio.
-- Si algo es ambiguo, preguntar: "¿Te refieres a X o a Y?" en lugar de asumir.
-- Si el cliente da datos de contacto, confirmar exactamente lo que entendiste y marcar como pendiente lo que faltó o fue ambiguo.
-- Si el correo o dato viene incompleto, NO inventarlo. Preguntar: "¿Me confirmas el correo completo?"
+- Nunca repetir preguntas ya respondidas.
 - Nunca inventar precios ni tiempos de entrega.
 - Si preguntan precio: "El costo depende de la configuración. Con los datos del proyecto te preparo una propuesta."
-- Si preguntan visita: "Sí, coordinamos una visita para validar medidas. ¿En qué zona está el proyecto?"
+- Si preguntan visita: "Coordinamos una visita técnica para validar medidas. ¿En qué zona está el proyecto?"
+- Usa el contexto de evaluación interna para saber qué preguntar a continuación.
 
-CONFIRMACIÓN DE DATOS (cuando el cliente da sus datos de contacto):
-Confirmar en formato limpio lo que SÍ entendiste. Marcar como "pendiente" lo ambiguo. No inventar nada.
-Ejemplo correcto:
-"Perfecto, [Nombre]. Confirmo:
-Empresa: [empresa]
-Ciudad: [ciudad]
-Teléfono: mismo número de WhatsApp
-Correo: [correo exacto como lo escribió]
-Con esto ya avanzo tu solicitud para coordinar visita y propuesta."
+PENSAR ANTES DE RESPONDER:
+Antes de escribir cada mensaje, evalúa:
+1. ¿Esta respuesta genera confianza?
+2. ¿Hace avanzar la venta hacia el siguiente paso?
+3. ¿Suena como una persona real trabajando en la empresa?
+Si alguna respuesta es NO, reescríbela.
 
 RESPONDE SOLO EN JSON VÁLIDO. Sin texto antes ni después. Sin markdown. Sin backticks.
 {
-  "respuesta": "tu respuesta aquí, máximo 2 párrafos cortos, estilo WhatsApp natural"
+  "etapa": "Primer contacto|Descubrimiento|Calificación|Recomendación|Cotización|Visita técnica|Cierre",
+  "siguiente_paso": "descripción interna de qué hacer después",
+  "respuesta": "texto para el cliente, máximo 2 párrafos cortos, estilo WhatsApp"
 }`;
 
 // ===== PARSE SEGURO DE JSON =====
@@ -174,21 +309,16 @@ function safeParseJSON(contenido) {
     }
   } catch (_) {}
 
-  // Si OpenAI respondió texto plano, usarlo directamente
   const texto = contenido.trim();
   if (texto.length > 5) return { respuesta: texto };
-
-  return { respuesta: '¿En qué puedo ayudarte con tu proyecto?' };
+  return { respuesta: 'Cuéntame más sobre tu proyecto.' };
 }
 
-// ===== GESTIÓN DE HISTORIAL =====
+// ===== HISTORIAL EN MEMORIA =====
 function agregarAlHistorial(clienteId, role, contenido) {
-  if (!conversaciones.has(clienteId)) {
-    conversaciones.set(clienteId, []);
-  }
+  if (!conversaciones.has(clienteId)) conversaciones.set(clienteId, []);
   const historial = conversaciones.get(clienteId);
   historial.push({ role, content: contenido });
-  // Mantener solo los últimos 10 intercambios (20 mensajes)
   if (historial.length > 20) historial.splice(0, historial.length - 20);
 }
 
@@ -196,38 +326,44 @@ function obtenerHistorial(clienteId) {
   return conversaciones.get(clienteId) || [];
 }
 
-// ===== TARA™ — GENERAR RESPUESTA CON OPENAI =====
+// ===== TARA™ — GENERAR RESPUESTA =====
 async function generarRespuestaTara(clienteId, mensajeCliente) {
   try {
     const historial = obtenerHistorial(clienteId);
 
+    // Behavior Layer: evaluar contexto antes de llamar a OpenAI
+    const contextoDinamico = construirContextoDinamico(historial);
+    const systemConContexto = TARA_SYSTEM_PROMPT + '\n\n' + contextoDinamico;
+
     const mensajes = [
-      { role: 'system', content: TARA_SYSTEM_PROMPT },
+      { role: 'system', content: systemConContexto },
       ...historial,
       { role: 'user', content: mensajeCliente },
     ];
 
-    console.log(`📤 OpenAI [${clienteId}]: historial=${historial.length / 2} turns`);
+    console.log(`\n📊 Behavior Layer [${clienteId}]:`);
+    console.log(contextoDinamico.trim());
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: mensajes,
       temperature: 0.65,
-      max_tokens: 500,
+      max_tokens: 600,
       response_format: { type: 'json_object' },
     });
 
     const crudo = response.choices[0].message.content.trim();
-    console.log(`📥 OpenAI raw: ${crudo.substring(0, 150)}`);
-
     const parsed = safeParseJSON(crudo);
-    const respuesta = parsed.respuesta || '¿En qué puedo ayudarte con tu proyecto?';
 
-    // Guardar en historial
+    // Log pensamiento interno de TARA
+    if (parsed.etapa) console.log(`🧠 Etapa: ${parsed.etapa} | Siguiente: ${parsed.siguiente_paso}`);
+
+    const respuesta = parsed.respuesta || 'Cuéntame más sobre tu proyecto.';
+
     agregarAlHistorial(clienteId, 'user', mensajeCliente);
     agregarAlHistorial(clienteId, 'assistant', respuesta);
 
-    console.log(`✅ TARA responde a ${clienteId}: ${respuesta.substring(0, 80)}...`);
+    console.log(`✅ TARA → ${clienteId}: ${respuesta.substring(0, 100)}...`);
     return respuesta;
   } catch (error) {
     console.error('❌ Error OpenAI:', error.message);
@@ -237,11 +373,9 @@ async function generarRespuestaTara(clienteId, mensajeCliente) {
 
 // ===== WEBHOOK META — VERIFICACIÓN =====
 app.get('/webhook', (req, res) => {
-  const verify_token = process.env.WEBHOOK_VERIFY_TOKEN;
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
-  if (token === verify_token) {
+  if (token === process.env.WEBHOOK_VERIFY_TOKEN) {
     res.status(200).send(challenge);
   } else {
     res.status(403).send('Invalid token');
@@ -252,7 +386,6 @@ app.get('/webhook', (req, res) => {
 app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
-
     if (body.object) {
       for (const entry of body.entry || []) {
         for (const change of entry.changes || []) {
@@ -262,7 +395,6 @@ app.post('/webhook', async (req, res) => {
                 const clienteId = message.from;
                 const texto = message.text.body;
                 console.log(`\n📱 Mensaje de ${clienteId}: "${texto}"`);
-
                 const respuesta = await generarRespuestaTara(clienteId, texto);
                 await enviarMensajeWhatsApp(clienteId, respuesta);
               }
@@ -306,18 +438,11 @@ async function enviarMensajeWhatsApp(numeroDestino, mensaje) {
 }
 
 // ===== API INTERNA — PROYECTOS =====
-
 app.post('/api/proyectos', async (req, res) => {
   try {
     const { cliente_id, cliente_nombre, cliente_email, cliente_telefono, ...datosProyecto } = req.body;
-
     const proyecto = new Proyecto(cliente_id, datosProyecto);
-    proyectos.set(proyecto.id, {
-      ...proyecto.toJSON(),
-      cliente_nombre,
-      cliente_email,
-      cliente_telefono,
-    });
+    proyectos.set(proyecto.id, { ...proyecto.toJSON(), cliente_nombre, cliente_email, cliente_telefono });
 
     const pdfPath = await generarPDF(proyecto.toJSON(), cliente_nombre, cliente_email);
 
@@ -341,15 +466,10 @@ app.post('/api/proyectos', async (req, res) => {
 
     await enviarMensajeWhatsApp(
       cliente_telefono,
-      `✅ Recibimos tu proyecto.\n\nNuestro equipo está revisando:\n• ${datosProyecto.tipo_sistema}\n• ${proyecto.calcularPosiciones()} posiciones\n\nPronto te contactamos para el siguiente paso.`
+      `✅ Listo, ya tenemos tu proyecto.\n\nRevisamos:\n• ${datosProyecto.tipo_sistema}\n• ${proyecto.calcularPosiciones()} posiciones\n\nTe contactamos para coordinar el siguiente paso.`
     );
 
-    res.json({
-      success: true,
-      proyecto_id: proyecto.id,
-      posiciones: proyecto.calcularPosiciones(),
-      costo_total: proyecto.calcularCosto(),
-    });
+    res.json({ success: true, proyecto_id: proyecto.id, posiciones: proyecto.calcularPosiciones(), costo_total: proyecto.calcularCosto() });
   } catch (error) {
     console.error('Error creando proyecto:', error);
     res.status(500).json({ error: error.message });
@@ -365,7 +485,6 @@ app.post('/api/proyectos/:id/agendar-cita', async (req, res) => {
   try {
     const { id } = req.params;
     const { fecha, hora } = req.body;
-
     const proyecto = proyectos.get(id);
     if (!proyecto) return res.status(404).json({ error: 'Proyecto no encontrado' });
 
@@ -374,7 +493,7 @@ app.post('/api/proyectos/:id/agendar-cita', async (req, res) => {
 
     await enviarMensajeWhatsApp(
       proyecto.cliente_telefono,
-      `🎉 ¡Tu proyecto está listo!\n\n📅 Cita confirmada:\n${fecha} a las ${hora}\n👤 Con: Alina Navarro\n\n¿Preguntas? Aquí estamos.`
+      `¡Todo listo!\n\n📅 Visita técnica confirmada:\n${fecha} a las ${hora}\n👤 Con: Alina Navarro\n\nCualquier duda me avisas.`
     );
 
     res.json({ success: true, proyecto });
@@ -392,7 +511,7 @@ async function generarPDF(proyecto, clienteNombre, clienteEmail) {
 }
 
 // ===== ARCHIVOS ESTÁTICOS =====
-app.use(require('express').static('public'));
+app.use(express.static('public'));
 
 app.get('/dashboard', (req, res) => {
   res.sendFile(__dirname + '/dashboard_vendedor.html');
@@ -403,7 +522,7 @@ app.get('/generador-pdf', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK', bot: 'TARA™', timestamp: new Date().toISOString() });
+  res.json({ status: 'OK', bot: 'TARA™ Behavior Layer v1', timestamp: new Date().toISOString() });
 });
 
 // ===== INICIAR SERVIDOR =====
@@ -411,7 +530,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`
 ╔════════════════════════════════════════════╗
-║   TARA™ — TOTAL RACKS BOT                 ║
+║   TARA™ — Behavior Layer v1               ║
 ║   ✓ Puerto: ${PORT}                           ║
 ║   ✓ Webhook: POST /webhook                ║
 ║   ✓ Dashboard: GET /dashboard             ║
